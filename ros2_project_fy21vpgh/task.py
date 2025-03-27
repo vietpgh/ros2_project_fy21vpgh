@@ -1,52 +1,79 @@
-
-#from __future__ import division
 import threading
-import sys, time
+import sys, time, signal, random
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Vector3
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
-from rclpy.exceptions import ROSInterruptException
-import signal
-import random
-
+from rclpy.action import ActionClient
+from sensor_msgs.msg import Image, LaserScan
+from geometry_msgs.msg import Twist
+from nav2_msgs.action import NavigateToPose
+from cv_bridge import CvBridge
+from math import sin, cos
 
 class Robot(Node):
     def __init__(self):
         super().__init__('robot')
-        
-        # Initialise a publisher to publish messages to the robot base
+
         self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.rate = self.create_rate(10)
+        self.bridge = CvBridge()
+        self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # Initialise any flags that signal a colour has been detected (default to false)
+        self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        self.create_subscription(LaserScan, '/scan', self.laser_callback, 10)
+
+        # Detection state
         self.blue_found = False
-        self.moveBackwardsFlag = False
-        self.moveForwardsFlag = False
-
+        self.green_found = False
+        self.red_found = False
+        self.obstacle_in_front = False
+        self.angular_z = 0.0
         self.sensitivity = 10
         
-        self.exploration_counter = 0
+        # Distance control parameters
+        self.target_distance = 1.0  # 1 meter from blue box
+        self.distance_tolerance = 0.1  # ±10cm tolerance
+        self.min_obstacle_distance = 1.2
+        
+        # Box tracking
+        self.blue_box_area = 0
+        self.blue_box_center_x = 0
+        self.estimated_distance = float('inf')
+        
+        # Movement flags
+        self.moveBackwardsFlag = False
+        self.moveForwardsFlag = False
+        self.at_target_distance = False
+        self.rotating = False
 
-        # Initialise some standard movement messages such as a simple move forward and a message with all zeroes (stop)
+        # Navigation goal
+        self.goal_index = 0
+        self.goals = [
+            (-8.5, -9.0, 0.0),
+            (-1.0, -5.0, 0.0),
+            (2.0, -2.0, 0.0),
+            (5.0, -4.0, 0.0),
+            (3.0, -8.0, 0.0)
+        ]
+        self.sending_goal = False
 
-        self.bridge = CvBridge()
-        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.callback, 10)
-        self.subscription  # prevent unused variable warning
+    def laser_callback(self, msg):
+        ranges = np.array(msg.ranges)
+        ranges = ranges[np.isfinite(ranges)]
 
-        self.target_area = 3000 # Estimated area when 1m from blue box
-        self.margin = 500
+        if len(ranges) == 0:
+            self.obstacle_in_front = False
+            return
 
-    def callback(self, data):
+        front_ranges = np.concatenate((ranges[0:15], ranges[-15:]))
+        min_distance = np.min(front_ranges)
+        self.obstacle_in_front = min_distance < self.min_obstacle_distance
 
-        # Convert the received image into a opencv image
-        try: 
+    def image_callback(self, data):
+        try:
             image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-        except CvBridgeError as e:
-            print(e)
+        except Exception as e:
+            self.get_logger().error(str(e))
             return
         
         cv2.namedWindow('camera_Feed',cv2.WINDOW_NORMAL)
@@ -54,132 +81,193 @@ class Robot(Node):
         cv2.resizeWindow('camera_Feed',320,240)
         cv2.waitKey(3)
         
-        # Set the upper and lower bounds for the colour blue        
-        hsv_blue_lower = np.array([120 - self.sensitivity, 100, 100])
-        hsv_blue_upper = np.array([120 + self.sensitivity, 255, 255])
-
-        # Convert the rgb image into a hsv image
         hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Blue box detection
+        lower_blue = np.array([120 - self.sensitivity, 100, 100])
+        upper_blue = np.array([120 + self.sensitivity, 255, 255])
+        blue_mask = cv2.inRange(hsv_image, lower_blue, upper_blue)
+        blue_contours, _ = cv2.findContours(blue_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Filter out everything but blue using the cv2.inRange() method
-        blue_mask = cv2.inRange(hsv_image, hsv_blue_lower, hsv_blue_upper)
+        # Green box detection
+        lower_green = np.array([60 - self.sensitivity, 100, 100])
+        upper_green = np.array([60 + self.sensitivity, 255, 255])
+        green_mask = cv2.inRange(hsv_image, lower_green, upper_green)
+        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Find the contours that appear within the blue mask using the cv2.findContours() method
-        contours, _ = cv2.findContours(blue_mask, mode=cv2.RETR_LIST, method=cv2.CHAIN_APPROX_SIMPLE)
+        # Red box detection
+        red_lower1 = np.array([0 - self.sensitivity, 100, 100])
+        red_upper1 = np.array([0 + self.sensitivity, 255, 255])
+        red_lower2 = np.array([180 - self.sensitivity, 100, 100])
+        red_upper2 = np.array([180 + self.sensitivity, 255, 255])
+        red_mask1 = cv2.inRange(hsv_image, red_lower1, red_upper1)
+        red_mask2 = cv2.inRange(hsv_image, red_lower2, red_upper2)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        red_contours, _ = cv2.findContours(red_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Loop over the contours
-        if len(contours)>0:
+        # Reset detection flags
+        self.blue_found = False
+        self.green_found = False
+        self.red_found = False
 
-            # There are a few different methods for identifying which contour is the biggest
-            # Loop through the list and keep track of which contour is biggest or
-            # Use the max() method to find the largest contour
-            
-            c = max(contours, key=cv2.contourArea)
+        # Handle blue box detection
+        if blue_contours:
+            c = max(blue_contours, key=cv2.contourArea)
             area = cv2.contourArea(c)
-            x = 500
-
-            #Check if the area of the shape you want is big enough to be considered
-            # If it is then change the flag for that colour to be True(1)
-            if area > x: #<What do you think is a suitable area?>
-                # Alter the value of the flag
+            if area > 500:  # Minimum area threshold
                 self.blue_found = True
-
-                #Check if a flag has been set = colour object detected - follow the colour object
-                if area > self.target_area + self.margin:
-                    # Too close to object, need to move backwards
-                    # Set a flag to tell the robot to move backwards when in the main loop
-                    self.moveForwardsFlag = False
-                    self.moveBackwardsFlag = True
-                    
-                elif area < self.target_area - self.margin:
-                    # Too far away from object, need to move forwards
-                    # Set a flag to tell the robot to move forwards when in the main loop
-                    self.moveForwardsFlag = True
-                    self.moveBackwardsFlag = False
-                else:
-                    self.moveForwardsFlag = False
-                    self.moveBackwardsFlag = False
-                    
-                M = cv2.moments(c)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                else:
-                    cx = image.shape[1] // 2
-
-                image_centre_x = image.shape[1] // 2
-                offset = cx - image_centre_x
-
-                self.angular_z = 0.0
-                if offset > 50:
-                    self.angular_z = -0.2  # Turn right
-                elif offset < -50:
-                    self.angular_z = 0.2   # Turn left
-
-                print(f"[INFO] Area: {area}, Offset: {offset}")
-            else:
-                self.blue_found = False
-        else:
-            self.blue_found = False
+                self.blue_box_area = area
                 
-            # Be sure to do this for the other colour as well
-            # Setting the flag to detect blue, and stop the turtlebot from moving if blue is detected
+                # Calculate center and offset
+                M = cv2.moments(c)
+                cx = int(M["m10"] / M["m00"]) if M["m00"] != 0 else image.shape[1] // 2
+                self.blue_box_center_x = cx - (image.shape[1] // 2)
+                
+                # Estimate distance based on area (empirical relationship)
+                self.estimated_distance = (300000 / area) ** 0.5
+                
+                # Check if we're at target distance
+                self.at_target_distance = abs(self.estimated_distance - self.target_distance) < self.distance_tolerance
 
-        # Show the resultant images you have created. You can show all of them or just the end result if you wish to.
+        # Handle green box detection
+        if green_contours:
+            c = max(green_contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                self.green_found = True
+
+        # Handle red box detection
+        if red_contours:
+            c = max(red_contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                self.red_found = True
 
     def move(self):
         twist = Twist()
 
         if self.blue_found:
-            twist.linear.x = 0.2 if self.moveForwardsFlag else -0.2 if self.moveBackwardsFlag else 0.0
-            twist.angular.z = getattr(self, 'angular_z', 0.0)
-        else:
-            # Explore (rotate in place)
-            self.exploration_counter += 1
-            
-            if self.exploration_counter % 50 == 0:
+            self.rotating = False
+            if self.at_target_distance:
+                # Stop when within 1m ± tolerance
                 twist.linear.x = 0.0
-                twist.angular.z = random.choice([0.5, -0.5])
+                twist.angular.z = 0.0
+                self.get_logger().info(f"Stopped at target distance: {self.estimated_distance:.2f}m")
             else:
-                twist.linear.x = 0.1
-                twist.linear.z = 0.0
+                # Move towards/away from blue box to reach target distance
+                distance_error = self.estimated_distance - self.target_distance
                 
+                # Proportional control for linear velocity
+                linear_vel = 0.3 * distance_error
+                linear_vel = np.clip(linear_vel, -0.2, 0.3)
+                
+                angular_vel = 0.0
+                    
+                # Apply obstacle check
+                if linear_vel > 0 and self.obstacle_in_front:
+                    linear_vel = 0.0
+                    angular_vel = 0.3
+
+                twist.linear.x = linear_vel
+                twist.angular.z = angular_vel
+                
+                self.get_logger().info(f"Approaching blue box. Distance: {self.estimated_distance:.2f}m, Target: {self.target_distance}m")
+
+        # If red or green is detected, ignore them and rotate in place
+        elif self.red_found or self.green_found:
+            self.get_logger().info("Red/Green box detected. Rotating in place.")
+            self.rotate_to_find_blue()
+
+        # Rotate if no box found
+        elif self.rotating:
+            twist.angular.z = 0.5
+        else:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+
         self.publisher.publish(twist)
+
 
     def stop(self):
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.publisher.publish(twist)
+        self.publisher.publish(Twist())
 
-# Create a node of your class in the main and ensure it stays up and running
-# handling exceptions and such
+    def rotate_to_find_blue(self):
+        # Rotate in place for 360 degrees to search for the blue box
+        self.rotating = True
+        threading.Timer(10.0, self.stop_rotation_and_move_on).start()
+
+    def stop_rotation_and_move_on(self):
+        self.rotating = False
+        if self.blue_found:
+            self.get_logger().info("Blue box found, moving towards it.")
+            self.move()
+        else:
+            self.get_logger().info("No blue box found, moving to next goal.")
+            self.send_next_goal()
+
+    def send_next_goal(self):
+        if self.goal_index >= len(self.goals):
+            self.get_logger().info("Finished all goals.")
+            return
+
+        x, y, theta = self.goals[self.goal_index]
+        self.goal_index += 1
+        self.sending_goal = True
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.orientation.z = sin(theta / 2)
+        goal_msg.pose.pose.orientation.w = cos(theta / 2)
+
+        self.nav_action_client.wait_for_server()
+        send_future = self.nav_action_client.send_goal_async(
+            goal_msg, feedback_callback=self.feedback_callback)
+        send_future.add_done_callback(self.goal_response_callback)
+
+    def feedback_callback(self, msg):
+        pass
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info("Goal rejected")
+            self.sending_goal = False
+            return
+
+        self.get_logger().info("Goal accepted")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.result_callback)
+
+    def result_callback(self, future):
+        self.get_logger().info("Arrived at goal point. Rotating to scan.")
+        self.sending_goal = False
+
+        self.rotating = True
+        threading.Timer(10.0, self.stop_rotation_and_move_on).start()
+
 def main():
     def signal_handler(sig, frame):
         robot.stop()
         rclpy.shutdown()
 
-    # Instantiate your class
-    # And rclpy.init the entire node
-    rclpy.init(args=None)
+    rclpy.init()
+    global robot
     robot = Robot()
-    
     signal.signal(signal.SIGINT, signal_handler)
-    thread = threading.Thread(target=rclpy.spin, args=(robot,), daemon=True)
-    thread.start()
+    threading.Thread(target=rclpy.spin, args=(robot,), daemon=True).start()
+
+    time.sleep(1)
+    robot.send_next_goal()
 
     try:
         while rclpy.ok():
-            # Publish moves
             robot.move()
             time.sleep(0.1)
-            pass
-
-    except ROSInterruptException:
+    except KeyboardInterrupt:
         pass
-
-    # Remember to destroy all image windows before closing node
-    cv2.destroyAllWindows()
+    finally:
+        cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
-
